@@ -60,7 +60,7 @@ html, body, [class*="css"] {
 }
 .stApp, .main { background-color: var(--bg) !important; }
 .block-container {
-    padding-top: 1.5rem !important;
+    padding-top: 4rem !important;
     padding-left: 2rem !important;
     padding-right: 2rem !important;
     max-width: 100% !important;
