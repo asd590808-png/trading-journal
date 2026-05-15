@@ -1,6 +1,6 @@
 """
-Prop Firm Trading Journal — Cloud Edition v3
-Fix: screenshots uploaded to Google Drive (URL stored in Sheets, no size limit)
+Prop Firm Trading Journal — Cloud Edition v4
+Fix: compress screenshot before storing as base64 in Sheets (no Drive needed)
 """
 
 import streamlit as st
@@ -8,8 +8,7 @@ import pandas as pd
 import base64
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from PIL import Image
 from io import BytesIO
 from datetime import date
 import plotly.graph_objects as go
@@ -35,17 +34,19 @@ SYMBOL_DB = {
 SYMBOL_LIST = ["MNQ","MES","MGC","GC","NQ","ES","自訂"]
 PSY_LIST    = ["冷靜執行","FOMO 追價","復仇交易","過度自信","過早平倉","計劃外進場","其他"]
 
-# screenshot_url instead of screenshot_b64
 TRADE_COLS = [
     "date","symbol","direction","entry","exit",
     "stop_usd","contracts","point_value",
-    "pnl","r_multiple","psychology","notes","screenshot_url"
+    "pnl","r_multiple","psychology","notes","screenshot_b64"
 ]
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# Google Sheets single cell limit ~50000 chars; we target safely below that
+MAX_B64_CHARS = 40000
 
 # ─── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -111,66 +112,49 @@ hr{border:none !important;border-top:1px solid var(--border) !important;margin:1
 """, unsafe_allow_html=True)
 
 
-# ─── Google API clients ───────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def get_creds():
-    return Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
+# ─── Image compression ───────────────────────────────────────────────────────
+def compress_image_to_b64(uploaded_file) -> str:
+    """
+    Compress image progressively until base64 fits under MAX_B64_CHARS.
+    Max output size ~800px wide, JPEG quality stepping down from 70.
+    """
+    img = Image.open(uploaded_file).convert("RGB")
 
+    # Resize: max width 800px
+    max_w = 800
+    if img.width > max_w:
+        ratio = max_w / img.width
+        img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+
+    # Try decreasing quality until it fits
+    for quality in [70, 55, 40, 28, 18]:
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        if len(b64) <= MAX_B64_CHARS:
+            return b64
+
+    # Last resort: shrink to 400px
+    img = img.resize((400, int(img.height * 400 / img.width)), Image.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=18, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def b64_to_bytes(s: str) -> bytes:
+    return base64.b64decode(s)
+
+
+# ─── Google Sheets ────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_gc():
-    return gspread.authorize(get_creds())
-
-@st.cache_resource(show_spinner=False)
-def get_drive():
-    return build("drive", "v3", credentials=get_creds())
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return gspread.authorize(creds)
 
 def open_wb():
     return get_gc().open_by_key(st.secrets["sheet_id"])
 
-def get_or_create_drive_folder() -> str:
-    """Return Drive folder ID named 'trading_journal_screenshots'."""
-    drive = get_drive()
-    q = "name='trading_journal_screenshots' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    res = drive.files().list(q=q, fields="files(id)").execute()
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name":"trading_journal_screenshots","mimeType":"application/vnd.google-apps.folder"}
-    f = drive.files().create(body=meta, fields="id").execute()
-    folder_id = f["id"]
-    # Make folder publicly viewable so images load in browser
-    drive.permissions().create(
-        fileId=folder_id,
-        body={"role":"reader","type":"anyone"},
-    ).execute()
-    return folder_id
-
-def upload_screenshot_to_drive(uploaded_file, filename: str) -> str:
-    """Upload image to Drive, return direct-view URL."""
-    drive     = get_drive()
-    folder_id = get_or_create_drive_folder()
-    ext       = uploaded_file.name.split(".")[-1].lower()
-    mime_map  = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp"}
-    mime      = mime_map.get(ext, "image/png")
-
-    media = MediaIoBaseUpload(BytesIO(uploaded_file.getbuffer()), mimetype=mime, resumable=False)
-    meta  = {"name": filename, "parents": [folder_id]}
-    f     = drive.files().create(body=meta, media_body=media, fields="id").execute()
-    file_id = f["id"]
-
-    # Make file publicly viewable
-    drive.permissions().create(
-        fileId=file_id,
-        body={"role":"reader","type":"anyone"},
-    ).execute()
-
-    # Return direct image URL
-    return f"https://drive.google.com/uc?id={file_id}"
-
-
-# ─── Sheets helpers ───────────────────────────────────────────────────────────
 def ensure_sheets(wb):
     titles = [ws.title for ws in wb.worksheets()]
     if "settings" not in titles:
@@ -223,12 +207,15 @@ def load_trades(wb):
     return out
 
 def save_trades(wb, trades):
+    """Save trades row-by-row to handle large screenshot cells safely."""
     ws = wb.worksheet("trades")
     ws.clear()
-    rows = [TRADE_COLS]
-    for t in trades:
-        rows.append([str(t.get(c,"")) for c in TRADE_COLS])
-    ws.update("A1", rows)
+    # Write header
+    ws.update("A1", [TRADE_COLS])
+    # Write each trade individually to avoid batch size limits
+    for i, t in enumerate(trades, start=2):
+        row = [str(t.get(c,"")) for c in TRADE_COLS]
+        ws.update(f"A{i}", [row])
 
 @st.cache_data(ttl=30, show_spinner="載入資料中…")
 def fetch_all():
@@ -316,7 +303,7 @@ MGC = $10 ／ GC &nbsp;= $100<br><br>
 # ─── Computed ────────────────────────────────────────────────────────────────
 df = pd.DataFrame(trades) if trades else pd.DataFrame(
     columns=["date","symbol","direction","entry","exit","stop_usd","contracts",
-             "point_value","pnl","r_multiple","psychology","notes","screenshot_url"]
+             "point_value","pnl","r_multiple","psychology","notes","screenshot_b64"]
 )
 for col in ["pnl","r_multiple","entry","exit","stop_usd","contracts","point_value"]:
     if col in df.columns:
@@ -402,11 +389,11 @@ with tab2:
         def_exit=float(ed.get("exit",0)); def_stop_usd=float(ed.get("stop_usd",0))
         def_contracts=int(ed.get("contracts",1)); def_psy=ed.get("psychology","冷靜執行")
         def_notes=ed.get("notes",""); def_cpv=float(ed.get("point_value",1))
-        existing_url=ed.get("screenshot_url","")
+        existing_b64=ed.get("screenshot_b64","")
     else:
         def_date=date.today(); def_sym="MNQ"; def_dir="Long"
         def_entry=0.0; def_exit=0.0; def_stop_usd=0.0; def_contracts=1
-        def_psy="冷靜執行"; def_notes=""; def_cpv=st.session_state.cpv; existing_url=""
+        def_psy="冷靜執行"; def_notes=""; def_cpv=st.session_state.cpv; existing_b64=""
 
     if is_edit:
         st.markdown(f'<div class="edit-banner">✏️ 編輯模式　<b>第 {edit_idx+1} 筆</b>　{ed.get("date","")}｜{ed.get("symbol","")} {ed.get("direction","")}<br>修改後按「儲存修改」，或按取消返回。</div>', unsafe_allow_html=True)
@@ -470,8 +457,8 @@ with tab2:
             t_notes = st.text_input("備註", value=def_notes, placeholder="簡短記錄你的想法…", label_visibility="collapsed")
 
         st.markdown("")
-        field("交易截圖（選填）","PNG / JPG / WEBP，上傳至 Google Drive")
-        if existing_url:
+        field("交易截圖（選填）","PNG / JPG / WEBP，自動壓縮後儲存")
+        if existing_b64:
             st.markdown('<div class="shot-card">📷 此筆已有截圖　（上傳新圖會覆蓋）</div>', unsafe_allow_html=True)
         t_upload = st.file_uploader("截圖", type=["png","jpg","jpeg","webp"], label_visibility="collapsed", key=f"up_{edit_idx}_{is_edit}")
 
@@ -491,32 +478,29 @@ with tab2:
         tr_risk = t_stop_usd * t_contracts
         r_m     = pnl / tr_risk if tr_risk > 0 else 0.0
 
-        # Upload screenshot to Drive if provided
-        new_url = existing_url
+        new_b64 = existing_b64
         if t_upload is not None:
-            with st.spinner("上傳截圖中…"):
+            with st.spinner("壓縮並儲存截圖中…"):
                 try:
-                    target_idx = edit_idx if is_edit else len(trades)
-                    fname = f"trade_{target_idx+1:04d}_{date.today().isoformat()}.{t_upload.name.split('.')[-1]}"
-                    new_url = upload_screenshot_to_drive(t_upload, fname)
+                    new_b64 = compress_image_to_b64(t_upload)
                 except Exception as e:
-                    st.warning(f"截圖上傳失敗（交易仍會儲存）：{e}")
-                    new_url = existing_url
+                    st.warning(f"截圖處理失敗（交易仍會儲存）：{e}")
+                    new_b64 = existing_b64
 
         record = {
-            "date":           t_date.isoformat(),
-            "symbol":         sel_sym,
-            "direction":      sel_dir,
-            "entry":          t_entry,
-            "exit":           t_exit,
-            "stop_usd":       round(t_stop_usd, 2),
-            "contracts":      t_contracts,
-            "point_value":    cur_pv,
-            "pnl":            round(pnl, 2),
-            "r_multiple":     round(r_m, 2),
-            "psychology":     t_psy,
-            "notes":          t_notes,
-            "screenshot_url": new_url,
+            "date":          t_date.isoformat(),
+            "symbol":        sel_sym,
+            "direction":     sel_dir,
+            "entry":         t_entry,
+            "exit":          t_exit,
+            "stop_usd":      round(t_stop_usd, 2),
+            "contracts":     t_contracts,
+            "point_value":   cur_pv,
+            "pnl":           round(pnl, 2),
+            "r_multiple":    round(r_m, 2),
+            "psychology":    t_psy,
+            "notes":         t_notes,
+            "screenshot_b64": new_b64,
         }
 
         if is_edit:
@@ -530,7 +514,7 @@ with tab2:
 
         pc2  = "#528060" if pnl >= 0 else "#C05050"
         verb = "已修改" if is_edit else "已記錄"
-        shot = "　｜　📷 截圖已儲存" if new_url else ""
+        shot = "　｜　📷 截圖已儲存" if new_b64 else ""
         st.markdown(f'<div class="ibox" style="border-left:3px solid {pc2};">✓ {verb}　<b>{sel_sym}</b> {sel_dir} × {t_contracts} 口　損益：<b style="color:{pc2};">${pnl:+,.2f}</b>　R：<b>{r_m:+.2f}R</b>{shot}</div>', unsafe_allow_html=True)
         st.rerun()
 
@@ -563,7 +547,7 @@ with tab3:
         for orig_i, t in sorted_trades:
             pv   = float(t.get("pnl",0))
             ps   = f"+${pv:,.0f}" if pv>=0 else f"-${abs(pv):,.0f}"
-            icon = "📷" if t.get("screenshot_url","") else "  "
+            icon = "📷" if t.get("screenshot_b64","") else "  "
             label_list.append(f"{icon} #{orig_i+1}　{t.get('date','')}　{t.get('symbol','')} {t.get('direction','')}　{ps}")
             orig_indices.append(orig_i)
 
@@ -586,11 +570,11 @@ with tab3:
             unsafe_allow_html=True
         )
 
-        shot_url = sel_trade.get("screenshot_url","")
-        if shot_url:
+        b64_str = sel_trade.get("screenshot_b64","")
+        if b64_str:
             with st.expander("📷  查看交易截圖", expanded=False):
-                st.markdown(f'<div style="text-align:center;"><img src="{shot_url}" style="max-width:100%;border-radius:4px;"/></div>', unsafe_allow_html=True)
-                st.markdown(f'<div style="font-size:0.72rem;color:#404558;margin-top:0.5rem;"><a href="{shot_url}" target="_blank" style="color:var(--slate);">↗ 在新分頁開啟原圖</a></div>', unsafe_allow_html=True)
+                st.markdown(f'<div style="text-align:center;"><img src="data:image/jpeg;base64,{b64_str}" style="max-width:100%;border-radius:4px;"/></div>', unsafe_allow_html=True)
+                st.download_button("⬇  下載截圖", data=b64_to_bytes(b64_str), file_name=f"trade_{sel_orig+1}.jpg", mime="image/jpeg")
         else:
             st.markdown('<div class="shot-card" style="border-left-color:var(--muted);">此筆尚未上傳截圖。進入「編輯」後可上傳。</div>', unsafe_allow_html=True)
 
@@ -623,7 +607,7 @@ with tab3:
 
         st.markdown('<div class="sec">匯出給 Claude 覆盤</div>', unsafe_allow_html=True)
         exp = raw_df.copy()
-        for dc_ in ["point_value"]:
+        for dc_ in ["point_value","screenshot_b64"]:
             if dc_ in exp.columns: exp = exp.drop(columns=[dc_])
         for k,v in settings.items(): exp[f"[帳戶]{k}"] = v
         csv_b = exp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
