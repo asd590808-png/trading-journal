@@ -1,6 +1,7 @@
 """
-Prop Firm Trading Journal — Cloud Edition v4
-Fix: compress screenshot before storing as base64 in Sheets (no Drive needed)
+Prop Firm Trading Journal — Cloud Edition v5
+Fix: use append_row() for new trades, targeted row update for edits
+     → avoids Sheets API payload size limits entirely
 """
 
 import streamlit as st
@@ -45,21 +46,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Google Sheets single cell limit ~50000 chars; we target safely below that
-MAX_B64_CHARS = 40000
+# Sheets hard limit per cell is ~50k chars; we compress well below that
+MAX_B64_CHARS = 30000
+
 
 # ─── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@300;400;500&family=Noto+Sans+TC:wght@300;400;500&family=IM+Fell+English:ital@1&display=swap');
-
-:root {
-    --bg:#1A1C1E; --bg2:#22252A; --sidebar:#1E2126; --text:#C8C3BC; --muted:#60646C;
-    --border:#2E3240; --red:#C05050; --red-dim:rgba(192,80,80,0.14);
-    --slate:#7A8FA0; --green:#528060; --grn-dim:rgba(82,128,96,0.14);
-    --card:#24272E; --input:#2A2E37; --accent:#8FAABF;
-    --amber:#B89060; --amb-dim:rgba(184,144,96,0.14);
-}
+:root{--bg:#1A1C1E;--bg2:#22252A;--sidebar:#1E2126;--text:#C8C3BC;--muted:#60646C;--border:#2E3240;--red:#C05050;--red-dim:rgba(192,80,80,0.14);--slate:#7A8FA0;--green:#528060;--grn-dim:rgba(82,128,96,0.14);--card:#24272E;--input:#2A2E37;--accent:#8FAABF;--amber:#B89060;--amb-dim:rgba(184,144,96,0.14);}
 html,body,[class*="css"]{font-family:'Noto Sans TC',sans-serif !important;color:var(--text) !important;background-color:var(--bg) !important;}
 .stApp,.main{background-color:var(--bg) !important;}
 .block-container{padding-top:4rem !important;padding-left:2rem !important;padding-right:2rem !important;max-width:100% !important;}
@@ -113,38 +108,26 @@ hr{border:none !important;border-top:1px solid var(--border) !important;margin:1
 
 
 # ─── Image compression ───────────────────────────────────────────────────────
-def compress_image_to_b64(uploaded_file) -> str:
-    """
-    Compress image progressively until base64 fits under MAX_B64_CHARS.
-    Max output size ~800px wide, JPEG quality stepping down from 70.
-    """
+def compress_to_b64(uploaded_file) -> str:
+    """Compress image to JPEG, resize & reduce quality until under MAX_B64_CHARS."""
     img = Image.open(uploaded_file).convert("RGB")
-
-    # Resize: max width 800px
-    max_w = 800
-    if img.width > max_w:
-        ratio = max_w / img.width
-        img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
-
-    # Try decreasing quality until it fits
-    for quality in [70, 55, 40, 28, 18]:
+    # Resize to max 800px wide
+    if img.width > 800:
+        img = img.resize((800, int(img.height * 800 / img.width)), Image.LANCZOS)
+    for quality in [65, 50, 35, 22, 15]:
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         b64 = base64.b64encode(buf.getvalue()).decode()
         if len(b64) <= MAX_B64_CHARS:
             return b64
-
-    # Last resort: shrink to 400px
+    # Last resort: 400px
     img = img.resize((400, int(img.height * 400 / img.width)), Image.LANCZOS)
     buf = BytesIO()
-    img.save(buf, format="JPEG", quality=18, optimize=True)
+    img.save(buf, format="JPEG", quality=15, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
-def b64_to_bytes(s: str) -> bytes:
-    return base64.b64decode(s)
 
-
-# ─── Google Sheets ────────────────────────────────────────────────────────────
+# ─── Google Sheets helpers ────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_gc():
     creds = Credentials.from_service_account_info(
@@ -171,7 +154,7 @@ def ensure_sheets(wb):
         ws = wb.add_worksheet("trades", rows=2, cols=len(TRADE_COLS))
         ws.update("A1", [TRADE_COLS])
 
-def load_settings(wb):
+def load_settings(wb) -> dict:
     rows = wb.worksheet("settings").get_all_values()[1:]
     out  = {}
     for r in rows:
@@ -185,12 +168,12 @@ def load_settings(wb):
         except: out[k] = float(defaults[k])
     return out
 
-def save_settings(wb, s):
+def save_settings(wb, s: dict):
     ws = wb.worksheet("settings")
     ws.clear()
-    ws.update("A1", [["key","value"]] + [[k,str(v)] for k,v in s.items()])
+    ws.update("A1", [["key","value"]] + [[k, str(v)] for k,v in s.items()])
 
-def load_trades(wb):
+def load_trades(wb) -> list:
     rows = wb.worksheet("trades").get_all_values()
     if len(rows) < 2: return []
     headers = rows[0]
@@ -206,16 +189,35 @@ def load_trades(wb):
         out.append(t)
     return out
 
-def save_trades(wb, trades):
-    """Save trades row-by-row to handle large screenshot cells safely."""
+def append_trade(wb, record: dict):
+    """Append a single new trade row — never rewrites the whole sheet."""
+    ws  = wb.worksheet("trades")
+    row = [str(record.get(c, "")) for c in TRADE_COLS]
+    ws.append_row(row, value_input_option="RAW")
+
+def update_trade_row(wb, sheet_row_index: int, record: dict):
+    """
+    Overwrite one existing trade row (1-based, header = row 1,
+    so first trade = row 2).
+    Splits into two updates: non-image fields first, then screenshot cell.
+    """
     ws = wb.worksheet("trades")
-    ws.clear()
-    # Write header
-    ws.update("A1", [TRADE_COLS])
-    # Write each trade individually to avoid batch size limits
-    for i, t in enumerate(trades, start=2):
-        row = [str(t.get(c,"")) for c in TRADE_COLS]
-        ws.update(f"A{i}", [row])
+    row = [str(record.get(c, "")) for c in TRADE_COLS]
+
+    # Write everything EXCEPT the screenshot column (last col)
+    last_col = len(TRADE_COLS)
+    non_img_row = row[:-1]  # all except screenshot_b64
+    col_letter  = chr(ord('A') + last_col - 2)  # column letter of last non-img col
+    ws.update(f"A{sheet_row_index}:{col_letter}{sheet_row_index}", [non_img_row])
+
+    # Write screenshot cell separately
+    img_col_letter = chr(ord('A') + last_col - 1)
+    ws.update(f"{img_col_letter}{sheet_row_index}", [[row[-1]]])
+
+def delete_trade_row(wb, sheet_row_index: int):
+    """Delete a single row by index (2 = first trade)."""
+    ws = wb.worksheet("trades")
+    ws.delete_rows(sheet_row_index)
 
 @st.cache_data(ttl=30, show_spinner="載入資料中…")
 def fetch_all():
@@ -223,10 +225,27 @@ def fetch_all():
     ensure_sheets(wb)
     return load_settings(wb), load_trades(wb)
 
-def persist():
+def persist_settings():
     wb = open_wb()
     save_settings(wb, st.session_state.settings)
-    save_trades(wb, st.session_state.trades)
+    fetch_all.clear()
+
+def persist_append(record: dict):
+    """Add new trade to sheet without rewriting everything."""
+    wb = open_wb()
+    append_trade(wb, record)
+    fetch_all.clear()
+
+def persist_update(sheet_row: int, record: dict):
+    """Update one existing row."""
+    wb = open_wb()
+    update_trade_row(wb, sheet_row, record)
+    fetch_all.clear()
+
+def persist_delete(sheet_row: int):
+    """Delete one row."""
+    wb = open_wb()
+    delete_trade_row(wb, sheet_row)
     fetch_all.clear()
 
 
@@ -239,6 +258,10 @@ def calc_pnl(symbol, direction, entry, exit_p, contracts, custom_pv=1.0):
     pv  = SYMBOL_DB[symbol]["point_value"] if symbol != "自訂" else custom_pv
     pts = (exit_p - entry) if direction == "Long" else (entry - exit_p)
     return pts * pv * contracts
+
+def sheet_row_of(trade_idx: int) -> int:
+    """Convert 0-based trade list index → 1-based Sheets row (header is row 1)."""
+    return trade_idx + 2
 
 
 # ─── Session State ────────────────────────────────────────────────────────────
@@ -288,13 +311,12 @@ MNQ = $2 ／ MES = $5<br>
 NQ &nbsp;= $20 ／ ES &nbsp;= $50<br>
 MGC = $10 ／ GC &nbsp;= $100<br><br>
 選好標的後系統<b style="color:#7A8FA0;">自動換算</b>，不用自己填。
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
     st.markdown("---")
 
     if st.button("儲存設置", use_container_width=True):
         st.session_state.settings = settings
-        persist()
+        persist_settings()
         st.success("設置已儲存 ✓")
 
     st.markdown(f'<div style="font-size:0.68rem;color:#404558;margin-top:0.4rem;">{settings["account_name"]}　|　{len(trades)} 筆紀錄</div>', unsafe_allow_html=True)
@@ -303,8 +325,7 @@ MGC = $10 ／ GC &nbsp;= $100<br><br>
 # ─── Computed ────────────────────────────────────────────────────────────────
 df = pd.DataFrame(trades) if trades else pd.DataFrame(
     columns=["date","symbol","direction","entry","exit","stop_usd","contracts",
-             "point_value","pnl","r_multiple","psychology","notes","screenshot_b64"]
-)
+             "point_value","pnl","r_multiple","psychology","notes","screenshot_b64"])
 for col in ["pnl","r_multiple","entry","exit","stop_usd","contracts","point_value"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -480,37 +501,30 @@ with tab2:
 
         new_b64 = existing_b64
         if t_upload is not None:
-            with st.spinner("壓縮並儲存截圖中…"):
+            with st.spinner("壓縮截圖中…"):
                 try:
-                    new_b64 = compress_image_to_b64(t_upload)
+                    new_b64 = compress_to_b64(t_upload)
                 except Exception as e:
                     st.warning(f"截圖處理失敗（交易仍會儲存）：{e}")
-                    new_b64 = existing_b64
 
         record = {
-            "date":          t_date.isoformat(),
-            "symbol":        sel_sym,
-            "direction":     sel_dir,
-            "entry":         t_entry,
-            "exit":          t_exit,
-            "stop_usd":      round(t_stop_usd, 2),
-            "contracts":     t_contracts,
-            "point_value":   cur_pv,
-            "pnl":           round(pnl, 2),
-            "r_multiple":    round(r_m, 2),
-            "psychology":    t_psy,
-            "notes":         t_notes,
-            "screenshot_b64": new_b64,
+            "date": t_date.isoformat(), "symbol": sel_sym, "direction": sel_dir,
+            "entry": t_entry, "exit": t_exit, "stop_usd": round(t_stop_usd,2),
+            "contracts": t_contracts, "point_value": cur_pv,
+            "pnl": round(pnl,2), "r_multiple": round(r_m,2),
+            "psychology": t_psy, "notes": t_notes, "screenshot_b64": new_b64,
         }
 
-        if is_edit:
-            trades[edit_idx] = record
-            st.session_state.edit_idx = None
-        else:
-            trades.append(record)
+        with st.spinner("儲存中…"):
+            if is_edit:
+                trades[edit_idx] = record
+                persist_update(sheet_row_of(edit_idx), record)
+                st.session_state.edit_idx = None
+            else:
+                persist_append(record)
+                trades.append(record)
 
         st.session_state.trades = trades
-        persist()
 
         pc2  = "#528060" if pnl >= 0 else "#C05050"
         verb = "已修改" if is_edit else "已記錄"
@@ -574,7 +588,8 @@ with tab3:
         if b64_str:
             with st.expander("📷  查看交易截圖", expanded=False):
                 st.markdown(f'<div style="text-align:center;"><img src="data:image/jpeg;base64,{b64_str}" style="max-width:100%;border-radius:4px;"/></div>', unsafe_allow_html=True)
-                st.download_button("⬇  下載截圖", data=b64_to_bytes(b64_str), file_name=f"trade_{sel_orig+1}.jpg", mime="image/jpeg")
+                st.download_button("⬇  下載截圖", data=base64.b64decode(b64_str),
+                                   file_name=f"trade_{sel_orig+1}.jpg", mime="image/jpeg")
         else:
             st.markdown('<div class="shot-card" style="border-left-color:var(--muted);">此筆尚未上傳截圖。進入「編輯」後可上傳。</div>', unsafe_allow_html=True)
 
@@ -585,10 +600,12 @@ with tab3:
                 st.session_state.edit_idx = sel_orig; st.rerun()
         with dc:
             if st.button("🗑  刪除此筆", use_container_width=True):
+                with st.spinner("刪除中…"):
+                    persist_delete(sheet_row_of(sel_orig))
                 trades.pop(sel_orig)
                 st.session_state.trades   = trades
                 st.session_state.edit_idx = None
-                persist(); st.rerun()
+                st.rerun()
 
         st.markdown('<div class="sec">統計摘要</div>', unsafe_allow_html=True)
         raw_df = pd.DataFrame(trades)
